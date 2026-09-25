@@ -30,6 +30,8 @@ _tqdm_std.tqdm._lock = threading.RLock()
 
 import asyncio
 import json
+import re
+import shutil
 import signal
 import wave
 from datetime import datetime
@@ -52,6 +54,14 @@ COMPUTE_TYPE = "int8"       # float16 if using cuda
 TRANSCRIPT_TIMESTAMP_FORMAT = "[%d-%m-%y]-[%H:%M]"
 # Format used for audio filenames on disk (must stay filesystem-safe/sortable)
 AUDIO_FILENAME_FORMAT = "%Y%m%d-%H%M%S"
+
+# Folder where hyprshot saves its screenshots to disk.
+SCREENSHOT_WATCH_DIR = Path.home() / "Pictures" / "Screenshots"
+SCREENSHOT_EXTS = {".png", ".jpg", ".jpeg"}
+# hyprshot's default filename: 2026-04-07-193233_hyprshot.png — this lets us
+# read the REAL capture time straight from the filename instead of trusting
+# the file's mtime or the folder's sort order.
+HYPRSHOT_FILENAME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}-\d{6})_hyprshot\.\w+$", re.IGNORECASE)
 
 _model = None  # loaded once, lazily
 
@@ -160,6 +170,7 @@ class VoiceLogApp(App):
     BINDINGS = [
         ("r", "toggle_record", "Record/Stop"),
         ("d", "delete_audio", "Delete clip"),
+        ("s", "add_screenshot", "Add screenshot"),
         ("h", "home", "Home"),
         ("q", "quit", "Quit"),
     ]
@@ -169,11 +180,24 @@ class VoiceLogApp(App):
         self.project_dir: Path | None = None
         self.audio_dir: Path | None = None
         self.transcript_path: Path | None = None
+        self.screenshots_dir: Path | None = None
+        # Cutoff for "new" screenshots: starts at project-open time, and
+        # advances to the last-imported capture time after each 's' press.
+        # This is what lets a whole burst of shots come in on one keypress
+        # without ever reaching back before the project was opened or
+        # re-importing an already-imported batch.
+        self._project_opened_at: datetime | None = None
+        self._last_import_cutoff: datetime | None = None
+        # Source paths already imported this session, as a safety net
+        # against double-importing the same file.
+        self._archived_screenshots: set[Path] = set()
         self.recording = False
         self._proc: asyncio.subprocess.Process | None = None
         self._current_wav: Path | None = None
         self._rec_start: datetime | None = None
-        self._audio_paths: list[Path] = []
+        # Combined list backing the left-hand list view: (kind, path) tuples
+        # where kind is "audio" or "screenshot", in on-screen order.
+        self._list_items: list[tuple[str, Path]] = []
         # Guards concurrent writes to transcript.txt / .index.json, since
         # several clips can be transcribing in background threads at once.
         self._transcript_lock = threading.Lock()
@@ -202,6 +226,11 @@ class VoiceLogApp(App):
         self.audio_dir.mkdir(parents=True, exist_ok=True)
         self.transcript_path = self.project_dir / "transcript.txt"
         self.transcript_path.touch(exist_ok=True)
+        self.screenshots_dir = self.project_dir / "Screenshots"
+        self.screenshots_dir.mkdir(parents=True, exist_ok=True)
+        self._archived_screenshots = set()
+        self._project_opened_at = datetime.now()
+        self._last_import_cutoff = self._project_opened_at
         self.title = f"FORLOG :: {name}"
         await self.refresh_audio_list()
         self.refresh_transcript_view()
@@ -213,28 +242,44 @@ class VoiceLogApp(App):
     async def refresh_audio_list(self) -> None:
         list_view = self.query_one("#audio-list", ListView)
         await list_view.clear()
-        self._audio_paths = sorted(self.audio_dir.glob("*.wav"))
-        for wav in self._audio_paths:
-            dur = self._wav_duration(wav)
-            label = f"{wav.stem}  ({dur:.1f}s)" if dur else f"{wav.stem}  (…)"
+
+        audio_items: list[tuple[str, Path]] = [
+            ("audio", p) for p in self.audio_dir.glob("*.wav")
+        ]
+        screenshot_items: list[tuple[str, Path]] = []
+        if self.screenshots_dir is not None:
+            screenshot_items = [
+                ("screenshot", p) for p in self.screenshots_dir.iterdir()
+                if p.is_file() and p.suffix.lower() in SCREENSHOT_EXTS
+            ]
+        # Both audio and screenshot files use AUDIO_FILENAME_FORMAT as their
+        # stem, so sorting by stem interleaves them in chronological order.
+        self._list_items = sorted(audio_items + screenshot_items, key=lambda item: item[1].stem)
+
+        for kind, path in self._list_items:
+            if kind == "audio":
+                dur = self._wav_duration(path)
+                label = f"{path.stem}  ({dur:.1f}s)" if dur else f"{path.stem}  (…)"
+            else:
+                label = f"{path.stem}  (scr)"
             await list_view.append(ListItem(Label(label)))
 
     async def action_delete_audio(self) -> None:
         list_view = self.query_one("#audio-list", ListView)
         index = list_view.index
-        if index is None or not self._audio_paths:
+        if index is None or not self._list_items:
             self.set_status("No clip selected to delete")
             return
         try:
-            wav_path = self._audio_paths[index]
+            kind, path = self._list_items[index]
         except IndexError:
             return
-        wav_path.unlink(missing_ok=True)
-        removed_line = self._remove_transcript_entry(wav_path.stem)
+        path.unlink(missing_ok=True)
+        removed_line = self._remove_transcript_entry(kind, path.stem)
         if removed_line:
-            self.set_status(f"Deleted: {wav_path.stem} (and its transcript line)")
+            self.set_status(f"Deleted: {path.stem} (and its transcript line)")
         else:
-            self.set_status(f"Deleted: {wav_path.stem}")
+            self.set_status(f"Deleted: {path.stem}")
         await self.refresh_audio_list()
         self.refresh_transcript_view()
 
@@ -242,6 +287,82 @@ class VoiceLogApp(App):
         text = self.transcript_path.read_text(encoding="utf-8") if self.transcript_path.exists() else ""
         self.query_one("#transcript-view", Static).update(text or "[dim](no transcriptions yet)[/dim]")
         self.query_one("#transcript-panel", VerticalScroll).scroll_end(animate=False)
+
+    # ---- Screenshots -----------------------------------------------------
+
+    @staticmethod
+    def _screenshot_captured_at(p: Path) -> datetime:
+        """Real capture time: parsed from hyprshot's filename when it
+        matches, falling back to the file's mtime otherwise."""
+        match = HYPRSHOT_FILENAME_RE.match(p.name)
+        if match:
+            try:
+                return datetime.strptime(match.group(1), "%Y-%m-%d-%H%M%S")
+            except ValueError:
+                pass
+        return datetime.fromtimestamp(p.stat().st_mtime)
+
+    def _list_screenshot_source(self) -> list[Path]:
+        if not SCREENSHOT_WATCH_DIR.exists():
+            return []
+        return [
+            p for p in SCREENSHOT_WATCH_DIR.iterdir()
+            if p.is_file() and p.suffix.lower() in SCREENSHOT_EXTS
+        ]
+
+    async def action_add_screenshot(self) -> None:
+        if self.screenshots_dir is None:
+            return
+        cutoff = self._last_import_cutoff or self._project_opened_at
+        new_shots = sorted(
+            (
+                p for p in self._list_screenshot_source()
+                if p not in self._archived_screenshots
+                and self._screenshot_captured_at(p) > cutoff
+            ),
+            key=self._screenshot_captured_at,
+        )
+        if not new_shots:
+            self.set_status("No hay capturas nuevas desde la última importación")
+            return
+
+        imported = 0
+        for src in new_shots:
+            if self._archive_screenshot(src):
+                self._archived_screenshots.add(src)
+                self._last_import_cutoff = self._screenshot_captured_at(src)
+                imported += 1
+
+        if imported:
+            await self.refresh_audio_list()
+            label = "captura" if imported == 1 else "capturas"
+            self.set_status(f"{imported} {label} añadidas — press 'r' to record")
+
+    def _archive_screenshot(self, src: Path) -> bool:
+        captured_at = self._screenshot_captured_at(src)
+        stem = captured_at.strftime(AUDIO_FILENAME_FORMAT)
+        dest = self.screenshots_dir / f"{stem}{src.suffix.lower()}"
+        counter = 1
+        while dest.exists():
+            dest = self.screenshots_dir / f"{stem}-{counter}{src.suffix.lower()}"
+            counter += 1
+        try:
+            shutil.copy2(src, dest)
+        except OSError as exc:
+            self.set_status(f"No se pudo copiar la captura {src.name}: {exc}")
+            return False
+
+        ts_label = captured_at.strftime(TRANSCRIPT_TIMESTAMP_FORMAT)
+        entry_line = f"{ts_label} [screenshot: {dest.name}]"
+        with self._transcript_lock:
+            with open(self.transcript_path, "a", encoding="utf-8") as f:
+                f.write(entry_line + "\n")
+            index = self._load_index()
+            index[self._index_key("screenshot", dest.stem)] = entry_line
+            self._save_index(index)
+
+        self.refresh_transcript_view()
+        return True
 
     @staticmethod
     def _wav_duration(path: Path) -> float | None:
@@ -266,12 +387,21 @@ class VoiceLogApp(App):
     def _save_index(self, index: dict[str, str]) -> None:
         self._index_path().write_text(json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    def _remove_transcript_entry(self, wav_stem: str) -> bool:
-        """Remove the exact transcript.txt line that belongs to wav_stem, if
-        one was ever written. Returns True if a line was actually removed."""
+    @staticmethod
+    def _index_key(kind: str, stem: str) -> str:
+        return f"{kind}:{stem}"
+
+    def _remove_transcript_entry(self, kind: str, stem: str) -> bool:
+        """Remove the exact transcript.txt line that belongs to this audio
+        clip or screenshot, if one was ever written. Returns True if a line
+        was actually removed."""
         with self._transcript_lock:
             index = self._load_index()
-            line_to_remove = index.pop(wav_stem, None)
+            line_to_remove = index.pop(self._index_key(kind, stem), None)
+            if line_to_remove is None and kind == "audio":
+                # Backward compatibility: older versions stored audio
+                # entries under the bare stem, with no "audio:" prefix.
+                line_to_remove = index.pop(stem, None)
             if line_to_remove is None:
                 # Clip was deleted before it finished transcribing, or was
                 # never transcribed — nothing to strip from the document.
@@ -319,7 +449,7 @@ class VoiceLogApp(App):
     def transcribe_clip(self, wav_path: Path) -> None:
         try:
             model = get_model()
-            segments, _info = model.transcribe(str(wav_path), language="es", beam_size=5)
+            segments, _info = model.transcribe(str(wav_path), beam_size=5)
             text = " ".join(seg.text.strip() for seg in segments).strip()
         except FileNotFoundError:
             self.call_from_thread(
@@ -341,7 +471,7 @@ class VoiceLogApp(App):
             with open(self.transcript_path, "a", encoding="utf-8") as f:
                 f.write(entry_line + "\n")
             index = self._load_index()
-            index[wav_path.stem] = entry_line
+            index[self._index_key("audio", wav_path.stem)] = entry_line
             self._save_index(index)
 
         self.call_from_thread(self._on_transcription_done, wav_path)
