@@ -14,10 +14,9 @@ as a medical examiner, Forlog lets you build a timeline of your project to
 use as raw material when writing it up afterward.
 
 Drafting a first version becomes as simple as feeding the resulting `.txt`
-to an AI with the right prompt, along with your screenshots (I may build a
-way to integrate this directly into the app down the line).
+to an AI with the right prompt, along with your screenshots.
 
-By default, `forlog.py` stores your audio clips and transcripts in a
+By default, `forlog.py` stores your audio clips, screenshots and transcripts in a
 `Forlog Archive` folder inside `Documents`.
 
 ## Screenshots
@@ -63,5 +62,6 @@ forlog
 ```
 - `r` — start/stop recording
 - `d` — delete the selected clip (and its transcript line)
+- `s` — add last screenshots on (/Pictures/Screenshots)
 - `h` — go back to project picker
 - `q` — quit
